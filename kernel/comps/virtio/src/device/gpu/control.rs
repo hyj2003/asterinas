@@ -29,12 +29,11 @@ impl VirtioGpuRect {
     }
 }
 
-/// VIRTIO_GPU_CMD_GET_DISPLAY_INFO
-/// 
+
 /// Retrieve the current output configuration. No request data (just bare struct virtio_gpu_ctrl_hdr). 
 /// Response type is VIRTIO_GPU_RESP_OK_DISPLAY_INFO, response data is struct virtio_gpu_resp_display_info.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod)]
+#[derive(Default, Debug, Clone, Copy, Pod)]
 pub struct VirtioGPUDisplayOne {
     r: VirtioGpuRect,
     // set when user enabled the display
@@ -43,13 +42,17 @@ pub struct VirtioGPUDisplayOne {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod)]
+#[derive(Default, Debug, Clone, Copy, Pod)]
 pub struct VirtioGPURespDisplayInfo {
     hdr: VirtioGPUCtrlHdr,
     pmodes: [VirtioGPUDisplayOne; VIRTIO_GPU_MAX_SCANOUTS],
 }
 
-// TODO: functions of Display Info....
+impl VirtioGPURespDisplayInfo {
+    pub fn header(&self) -> VirtioGPUCtrlHdr {
+        self.hdr
+    }
+}
 
 
 

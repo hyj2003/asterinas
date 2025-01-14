@@ -1,9 +1,12 @@
+use core::hint::spin_loop;
+
 use alloc::{
     boxed::Box,
     sync::Arc,
 };
 use log::{debug, info};
 use ostd::early_println;
+use ostd::mm::VmIo;
 use ostd::task::scheduler::info;
 use ostd::{
     sync::SpinLock,
@@ -18,18 +21,23 @@ use crate::{
 
 use super::{
     config::{GPUFeatures, VirtioGPUConfig},
-    header::VirtioGPUCtrlHdr,
+    header::{VirtioGPUCtrlHdr, VirtioGPUCtrlType},
+    control::{VirtioGPURespDisplayInfo, VirtioGPUGetEdid},
+    cursor::{VirtioGPUCursorPos, VirtioGPUUpdateCursor, VirtioGPURespUpdateCursor},
 };
+
+const REQ_SIZE: usize = 16;
+const RESP_SIZE: usize = 1;
 
 pub struct GPUDevice {
     config_manager: ConfigManager<VirtioGPUConfig>,
     transport: SpinLock<Box<dyn VirtioTransport>>,
     control_queue: SpinLock<VirtQueue>,
     cursor_queue: SpinLock<VirtQueue>,
-    controlq_receiver: DmaStream,
-    controlq_sender: DmaStream,
-    // cursor_receiver: DmaStream,          // TODO: ?
-    // cursor_sender: DmaStream,
+    controlq_request: DmaStream,
+    controlq_response: DmaStream,
+    cursorq_request: DmaStream,          // TODO: ?
+    cursorq_response: DmaStream,
     // callback                             // FIXME: necessary?
 }
 
@@ -58,13 +66,21 @@ impl GPUDevice {
             SpinLock::new(VirtQueue::new(CURSOR_QUEUE_INDEX, Self::QUEUE_SIZE, transport.as_mut()).unwrap());
 
         // init buffer
-        let controlq_receiver = {
+        let controlq_request = {
             let segment = FrameAllocOptions::new().alloc_segment(1).unwrap();
-            DmaStream::map(segment.into(), DmaDirection::ToDevice, false).unwrap()
+            DmaStream::map(segment.into(), DmaDirection::Bidirectional, false).unwrap()
         };
-        let controlq_sender = {
+        let controlq_response = {
             let segment = FrameAllocOptions::new().alloc_segment(1).unwrap();
-            DmaStream::map(segment.into(), DmaDirection::FromDevice, false).unwrap()
+            DmaStream::map(segment.into(), DmaDirection::Bidirectional, false).unwrap()
+        };
+        let cursorq_request = {
+            let segment = FrameAllocOptions::new().alloc_segment(1).unwrap();
+            DmaStream::map(segment.into(), DmaDirection::Bidirectional, false).unwrap()
+        };
+        let cursorq_response = {
+            let segment = FrameAllocOptions::new().alloc_segment(1).unwrap();
+            DmaStream::map(segment.into(), DmaDirection::Bidirectional, false).unwrap()
         };
 
         // init device
@@ -73,8 +89,10 @@ impl GPUDevice {
             transport: SpinLock::new(transport),
             control_queue,
             cursor_queue,
-            controlq_receiver,
-            controlq_sender
+            controlq_request,
+            controlq_response,
+            cursorq_request,
+            cursorq_response,
             // TODO: ...
         });
 
@@ -111,5 +129,139 @@ impl GPUDevice {
         info!("Virtio-GPU handle config change");
         // TODO
     }
+
+    fn request_display_info(&self) -> Result<VirtioGPURespDisplayInfo, VirtioDeviceError> {
+        let req_slice = {
+            let req_slice = DmaStreamSlice::new(&self.controlq_request, 0, REQ_SIZE);
+            let req: VirtioGPUCtrlHdr = VirtioGPUCtrlHdr {
+                ctrl_type: VirtioGPUCtrlType::VIRTIO_GPU_CMD_GET_DISPLAY_INFO as u32,
+                ..VirtioGPUCtrlHdr::default()
+            };
+            req_slice.write_val(0, &req).unwrap();
+            req_slice.sync().unwrap();
+            req_slice
+        };
+
+        let resp_slice = {
+            let resp_slice = DmaStreamSlice::new(&self.controlq_response, 0, RESP_SIZE);
+            resp_slice.write_val(0, &VirtioGPURespDisplayInfo::default()).unwrap();
+            resp_slice
+        };
+        
+        let mut control_queue = self.control_queue.disable_irq().lock();
+        control_queue
+            .add_dma_buf(&[&req_slice], &[&resp_slice])
+            .expect("add queue failed");
+
+        if control_queue.should_notify() {
+            control_queue.notify();
+        }
+
+        while !control_queue.can_pop() {
+            spin_loop();
+        }
+        control_queue.pop_used().expect("pop used failed");
+
+        resp_slice.sync().unwrap();
+        let resp: VirtioGPURespDisplayInfo = resp_slice.read_val(0).unwrap();
+
+        if resp.header().ctrl_type == VirtioGPUCtrlType::VIRTIO_GPU_RESP_OK_DISPLAY_INFO as u32 {
+            Ok(resp)
+        } else {
+            Err(VirtioDeviceError::QueueUnknownError)
+        }
+    }
+
+
+    /// use when cursor is updated with new resources
+    fn request_cursor_update(
+        &self, pos: VirtioGPUCursorPos, 
+        resource_id: u32, 
+        padding: u32
+    ) -> Result<VirtioGPURespUpdateCursor, VirtioDeviceError> {
+        info!("[CursorUpdate] Transfer cursor update with resource_id {:?}", resource_id);
+        let req_slice = {
+            let req_slice = DmaStreamSlice::new(&self.cursorq_request, 0, REQ_SIZE);
+            let req_data: VirtioGPUUpdateCursor = VirtioGPUUpdateCursor::update_cursor(pos, resource_id, padding);
+            req_slice.write_val(0, &req_data).unwrap();
+            req_slice.sync().unwrap();
+            req_slice
+        };
+
+        let resp_slice = {
+            let resp_slice = DmaStreamSlice::new(&self.cursorq_response, 0, RESP_SIZE);
+            resp_slice.write_val(0, &VirtioGPURespUpdateCursor::new()).unwrap();
+            resp_slice
+        };
+
+        let mut cursor_queue = self.cursor_queue.disable_irq().lock();
+        cursor_queue
+            .add_dma_buf(&[&req_slice], &[&resp_slice])
+            .expect("[CursorUpdate] add queue failed");
+
+        if cursor_queue.should_notify() {
+            cursor_queue.notify();
+        }
+        while !cursor_queue.can_pop() {
+            spin_loop();
+        }
+        cursor_queue.pop_used().expect("[CursorUpdate] pop used failed");
+
+        resp_slice.sync().unwrap();
+        let resp: VirtioGPURespUpdateCursor = resp_slice.read_val(0).unwrap();
+
+        if resp.header().ctrl_type == VirtioGPUCtrlType::VIRTIO_GPU_RESP_OK_NODATA as u32 {
+            Ok(resp)
+        } else {
+            Err(VirtioDeviceError::QueueUnknownError)
+        }
+    }
+
+
+    /// use when cursor only moves
+    fn request_cursor_move(
+        &self,
+        hot_x: u32,
+        hot_y: u32,
+        padding: u32
+    ) -> Result<VirtioGPURespUpdateCursor, VirtioDeviceError> {
+        info!("[CursorMove] Transfer cursor move to ({:?}, {:?})", hot_x, hot_y);
+        let req_slice = {
+            let req_slice = DmaStreamSlice::new(&self.cursorq_request, 0, REQ_SIZE);
+            let req_data: VirtioGPUUpdateCursor = VirtioGPUUpdateCursor::move_cursor(hot_x, hot_y, padding);
+            req_slice.write_val(0, &req_data).unwrap();
+            req_slice.sync().unwrap();
+            req_slice
+        };
+
+        let resp_slice = {
+            let resp_slice = DmaStreamSlice::new(&self.cursorq_response, 0, RESP_SIZE);
+            resp_slice.write_val(0, &VirtioGPURespUpdateCursor::new()).unwrap();
+            resp_slice
+        };
+
+        let mut cursor_queue = self.cursor_queue.disable_irq().lock();
+        cursor_queue
+            .add_dma_buf(&[&req_slice], &[&resp_slice])
+            .expect("[CursorUpdate] add queue failed");
+
+        if cursor_queue.should_notify() {
+            cursor_queue.notify();
+        }
+        while !cursor_queue.can_pop() {
+            spin_loop();
+        }
+        cursor_queue.pop_used().expect("[CursorUpdate] pop used failed");
+
+        resp_slice.sync().unwrap();
+        let resp: VirtioGPURespUpdateCursor = resp_slice.read_val(0).unwrap();
+
+        if resp.header().ctrl_type == VirtioGPUCtrlType::VIRTIO_GPU_RESP_OK_NODATA as u32 {
+            Ok(resp)
+        } else {
+            Err(VirtioDeviceError::QueueUnknownError)
+        }
+    }
+
 }
 
