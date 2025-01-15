@@ -3,18 +3,20 @@ use bitflags::bitflags;
 use ostd::Pod;
 /* Ref. network::header */
 
+pub const kBlockSize: u32 = 4096;
+
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy, Pod)]
 pub struct VirtioGPUCtrlHdr {
-    ctrl_type: u32,     // specify request/response type
-    flags: u8,       // see usages
-    fence_id: u64,      
+    pub ctrl_type: u32,     // specify request/response type
+    pub flags: u32,       // see usages
+    pub fence_id: u64,      
     // if FLAG_FENCE is set, device must copy fence_id from request to response
-    ctx_id: u32,
-    ring_idx: u8,       
+    pub ctx_id: u32,
+    pub ring_idx: u8,       
     // if INFO_RING_IDX is set and vio_GPU_F_CONTEXT_INIT is supported,
     // driver MAY set FLAG_INFO_RING_IDX in request flags.(range 0-63)
-    padding: [u8; 3],
+    pub padding: [u8; 3],
 }
 
 #[repr(u32)]
@@ -80,7 +82,7 @@ impl VirtioGPUCtrlHdr {
     pub fn from_type(ctrl_type: VirtioGPUCtrlType) -> Self {
         VirtioGPUCtrlHdr {
             ctrl_type: ctrl_type as u32,
-            flags: 0,
+            flags: 0 as u32,
             fence_id: 0,
             ctx_id: 0,
             ring_idx: 0,
